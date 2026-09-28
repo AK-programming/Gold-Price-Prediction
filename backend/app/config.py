@@ -166,7 +166,13 @@ WALK_FORWARD_CONFIG = {
 # API
 # ============================================================
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
-API_PORT = int(os.getenv("API_PORT", "7860"))
+# Most hosting platforms (Render, Heroku, and it turns out HF Spaces too)
+# inject a $PORT env var and expect the app to bind there, while their own
+# proxy holds the conventional port (e.g. 7860) for incoming traffic. If we
+# ignore $PORT and hardcode 7860, our process fights the platform's own
+# listener for that port - which is exactly the "address already in use"
+# crash seen on Spaces. Prefer $PORT when the platform sets it.
+API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "7860")))
 API_PREFIX = "/api/v1"
 CORS_ORIGINS = ["*"]
 
