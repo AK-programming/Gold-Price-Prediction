@@ -68,7 +68,8 @@ class AttentionVisualizer:
             # Strategy 1: model explicitly provides attention weights
             if hasattr(model, "get_attention_weights"):
                 with torch.no_grad():
-                    attn = model.get_attention_weights(x_tensor)
+                    model(x_tensor)
+                    attn = model.get_attention_weights()
                 self.raw_attention = (
                     attn.cpu().numpy() if isinstance(attn, torch.Tensor) else np.asarray(attn)
                 )

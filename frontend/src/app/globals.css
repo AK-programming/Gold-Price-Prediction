@@ -10,38 +10,38 @@
 :root {
   /* Gold palette */
   --gold: #d4af37;
-  --gold-light: #ffd700;
-  --gold-dark: #b8860b;
+  --gold-light: #b8860b;
+  --gold-dark: #8b6508;
   --gold-muted: #a8923a;
   --gold-gradient: linear-gradient(135deg, #d4af37 0%, #ffd700 50%, #b8860b 100%);
-  --gold-text-gradient: linear-gradient(135deg, #ffd700 0%, #d4af37 50%, #f0c040 100%);
+  --gold-text-gradient: linear-gradient(135deg, #b8860b 0%, #d4af37 50%, #8b6508 100%);
 
   /* Backgrounds */
-  --bg-primary: #0a0a0f;
-  --bg-secondary: #12121a;
-  --bg-tertiary: #1a1a2e;
-  --bg-card: rgba(26, 26, 46, 0.6);
-  --bg-card-hover: rgba(36, 36, 62, 0.7);
-  --bg-elevated: rgba(30, 30, 50, 0.8);
+  --bg-primary: #f9fafb;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #f3f4f6;
+  --bg-card: rgba(255, 255, 255, 0.8);
+  --bg-card-hover: rgba(255, 255, 255, 1);
+  --bg-elevated: rgba(255, 255, 255, 0.9);
 
   /* Glass */
-  --glass-bg: rgba(18, 18, 30, 0.55);
-  --glass-bg-hover: rgba(26, 26, 46, 0.7);
-  --glass-border: rgba(212, 175, 55, 0.15);
-  --glass-border-hover: rgba(212, 175, 55, 0.35);
-  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --glass-bg: rgba(255, 255, 255, 0.65);
+  --glass-bg-hover: rgba(255, 255, 255, 0.9);
+  --glass-border: rgba(0, 0, 0, 0.08);
+  --glass-border-hover: rgba(0, 0, 0, 0.15);
+  --glass-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
   --glass-blur: 16px;
 
   /* Text */
-  --text-primary: #f0f0f5;
-  --text-secondary: #9a9ab0;
-  --text-tertiary: #6b6b80;
-  --text-gold: #d4af37;
+  --text-primary: #111827;
+  --text-secondary: #4b5563;
+  --text-tertiary: #6b7280;
+  --text-gold: #b8860b;
 
   /* Accents */
-  --green: #00e676;
-  --red: #ff5252;
-  --blue: #448aff;
+  --green: #10b981;
+  --red: #ef4444;
+  --blue: #3b82f6;
 
   /* Spacing */
   --space-xs: 4px;
@@ -91,9 +91,7 @@ body {
   line-height: 1.6;
   min-height: 100vh;
   overflow-x: hidden;
-  background-image:
-    radial-gradient(ellipse 80% 60% at 50% -20%, rgba(212, 175, 55, 0.06) 0%, transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 80%, rgba(212, 175, 55, 0.03) 0%, transparent 50%);
+  background-image: none;
 }
 
 a {
@@ -166,7 +164,7 @@ img {
   border-color: var(--glass-border-hover);
   background: var(--glass-bg-hover);
   transform: translateY(-2px);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5), 0 0 20px rgba(212, 175, 55, 0.05);
+  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.08), 0 0 10px rgba(0, 0, 0, 0.02);
 }
 
 /* ── Header ────────────────────────────────────────────────── */
@@ -225,6 +223,101 @@ img {
   border-radius: 50%;
   background: var(--gold);
   animation: pulse-glow 2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.demo-retry-btn {
+  margin-left: auto;
+  padding: 0.35rem 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(212, 175, 55, 0.35);
+  background: rgba(212, 175, 55, 0.12);
+  color: var(--gold);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.demo-retry-btn:hover:not(:disabled) {
+  background: rgba(212, 175, 55, 0.22);
+}
+
+.demo-retry-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+/* ── Data freshness bar ────────────────────────────────────── */
+.data-freshness-bar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+  background: rgba(68, 138, 255, 0.08);
+  border: 1px solid rgba(68, 138, 255, 0.2);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-lg);
+}
+
+.data-freshness-bar.stale {
+  background: rgba(255, 152, 0, 0.08);
+  border-color: rgba(255, 152, 0, 0.35);
+}
+
+.data-freshness-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.data-freshness-text strong {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.data-freshness-meta {
+  line-height: 1.45;
+}
+
+.data-stale-hint {
+  color: #ffb74d;
+}
+
+.data-refresh-btn {
+  flex-shrink: 0;
+  padding: 0.45rem 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(68, 138, 255, 0.4);
+  background: rgba(68, 138, 255, 0.15);
+  color: #90caf9;
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.data-refresh-btn:hover:not(:disabled) {
+  background: rgba(68, 138, 255, 0.28);
+}
+
+.data-refresh-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.shap-chart-wrap {
+  width: 100%;
+  min-width: 0;
+  height: 360px;
+}
+
+.loading-hint {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: var(--space-md);
 }
 
 /* ── Stats Grid ────────────────────────────────────────────── */
@@ -305,7 +398,7 @@ img {
   background: var(--bg-secondary);
   border-radius: var(--radius-full);
   padding: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(0, 0, 0, 0.1);
   width: fit-content;
 }
 
@@ -329,7 +422,7 @@ img {
 
 .range-btn.active {
   background: var(--gold);
-  color: #0a0a0f;
+  color: #ffffff;
 }
 
 /* ── Chart Container ───────────────────────────────────────── */
@@ -499,9 +592,9 @@ img {
 .skeleton {
   background: linear-gradient(
     90deg,
-    rgba(255, 255, 255, 0.04) 25%,
-    rgba(255, 255, 255, 0.08) 50%,
-    rgba(255, 255, 255, 0.04) 75%
+    rgba(0, 0, 0, 0.04) 25%,
+    rgba(0, 0, 0, 0.08) 50%,
+    rgba(0, 0, 0, 0.04) 75%
   );
   background-size: 200% 100%;
   animation: shimmer 1.8s ease-in-out infinite;
@@ -527,12 +620,12 @@ img {
 
 /* ── Tooltip Override (Recharts) ────────────────────────────── */
 .custom-tooltip {
-  background: rgba(14, 14, 24, 0.95) !important;
+  background: rgba(255, 255, 255, 0.95) !important;
   backdrop-filter: blur(12px);
   border: 1px solid var(--glass-border) !important;
   border-radius: var(--radius-md) !important;
   padding: var(--space-sm) var(--space-md) !important;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15) !important;
 }
 
 .custom-tooltip .label {
@@ -542,7 +635,7 @@ img {
 }
 
 .custom-tooltip .value {
-  color: var(--gold-light);
+  color: var(--text-primary);
   font-weight: 700;
   font-size: 1rem;
 }

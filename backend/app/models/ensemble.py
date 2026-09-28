@@ -97,6 +97,10 @@ class StackingEnsemble:
             Meta-feature matrix of shape ``(n_samples, 5 * output_seq_len)``,
             i.e. each base model contributes ``output_seq_len`` columns.
         """
+        n_samples = min(X_seq.shape[0], X_tab.shape[0])
+        X_seq = X_seq[:n_samples]
+        X_tab = X_tab[:n_samples]
+
         preds_list: List[np.ndarray] = []
 
         # --- Neural models (Transformer & LSTM) ---
@@ -289,3 +293,47 @@ class StackingEnsemble:
         self.cv_folds = data.get("cv_folds", self.cv_folds)
         logger.info("Ensemble meta-learner loaded from %s", path)
         return self
+
+
+def load_stacking_ensemble(
+    device: Optional[torch.device] = None,
+) -> StackingEnsemble:
+    """Load all base checkpoints and the fitted stacking meta-learner."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt_dir = config.CHECKPOINT_DIR
+
+    required = {
+        "transformer": ckpt_dir / "transformer.pt",
+        "lstm": ckpt_dir / "lstm.pt",
+        "xgboost": ckpt_dir / "xgboost.joblib",
+        "lightgbm": ckpt_dir / "lightgbm.joblib",
+        "catboost": ckpt_dir / "catboost.joblib",
+        "ensemble": ckpt_dir / "ensemble.joblib",
+    }
+    missing = [name for name, path in required.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing checkpoint(s) for ensemble: {missing}. "
+            "Run: python build_ensemble.py"
+        )
+
+    transformer_ckpt = torch.load(required["transformer"], map_location="cpu")
+    lstm_ckpt = torch.load(required["lstm"], map_location="cpu")
+    num_features = int(transformer_ckpt["num_features"])
+
+    transformer = GoldTransformer(num_features=num_features)
+    transformer.load_state_dict(transformer_ckpt["model_state_dict"])
+
+    lstm = GoldLSTM(num_features=num_features)
+    lstm.load_state_dict(lstm_ckpt["model_state_dict"])
+
+    ensemble = StackingEnsemble(
+        transformer=transformer,
+        lstm=lstm,
+        xgb_model=XGBoostModel().load(required["xgboost"]),
+        lgb_model=LightGBMModel().load(required["lightgbm"]),
+        cat_model=CatBoostModel().load(required["catboost"]),
+        device=device,
+    )
+    ensemble.load(required["ensemble"])
+    return ensemble

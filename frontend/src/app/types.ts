@@ -2,6 +2,27 @@
    GoldSight AI — API Response Types
    ────────────────────────────────────────────── */
 
+/** GET /api/v1/data/status */
+export interface DataStatusResponse {
+  last_data_date: string;
+  last_close_usd: number;
+  ticker: string;
+  source_label: string;
+  days_behind: number;
+  live_quote_usd: number | null;
+  live_quote_date: string | null;
+  features_ready: boolean;
+}
+
+/** POST /api/v1/data/refresh */
+export interface DataRefreshResponse {
+  status: string;
+  message: string;
+  last_data_date: string;
+  last_close_usd: number;
+  rows_downloaded: number;
+}
+
 /** GET /api/v1/forecast */
 export interface ForecastResponse {
   dates: string[];
@@ -45,7 +66,8 @@ export interface ModelSummary {
 /** GET /api/v1/models */
 export interface ModelsListResponse {
   models: ModelSummary[];
-  latest_run: string;
+  latest_run: string | null;
+  best_model?: string | null;
 }
 
 /** Single feature entry from SHAP */

@@ -1,15 +1,11 @@
 """
-Gold Price Forecasting System — Model Info & Explainability Routes
-
-FastAPI router for inspecting trained models, retrieving metrics,
-SHAP feature importance, attention heatmaps, and triggering retraining.
+Model metadata and explainability routes.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -22,45 +18,31 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix=config.API_PREFIX, tags=["models"])
 
 
-# ------------------------------------------------------------------ #
-# Pydantic response models
-# ------------------------------------------------------------------ #
-
-
 class ModelSummary(BaseModel):
-    """Summary of a single trained model."""
-
     name: str
     metrics: Dict[str, float] = Field(default_factory=dict)
     checkpoint_exists: bool = False
 
 
 class ModelsListResponse(BaseModel):
-    """Response schema for ``GET /models``."""
-
     models: List[ModelSummary]
     latest_run: Optional[str] = None
+    best_model: Optional[str] = None
 
 
 class MetricsDetailResponse(BaseModel):
-    """Detailed metrics for a single model."""
-
     name: str
     metrics: Dict[str, float]
     per_horizon: Optional[Dict[str, Dict[str, float]]] = None
 
 
 class ShapResponse(BaseModel):
-    """SHAP feature importance payload."""
-
     feature_importance: List[Dict[str, Any]] = Field(default_factory=list)
     num_samples: int = 0
     num_features: int = 0
 
 
 class AttentionResponse(BaseModel):
-    """Attention heatmap payload."""
-
     temporal_importance: List[float] = Field(default_factory=list)
     sequence_length: int = 0
     attention_shape: List[int] = Field(default_factory=list)
@@ -68,15 +50,9 @@ class AttentionResponse(BaseModel):
 
 
 class RetrainResponse(BaseModel):
-    """Acknowledgement that retraining has been queued."""
-
     status: str = "queued"
     message: str = "Retraining started in background."
 
-
-# ------------------------------------------------------------------ #
-# Helpers
-# ------------------------------------------------------------------ #
 
 _KNOWN_MODELS = [
     "transformer",
@@ -88,34 +64,81 @@ _KNOWN_MODELS = [
 ]
 
 
-def _load_latest_metrics() -> Dict[str, Any]:
-    """Find and parse the newest ``metrics_*.json`` in ``config.LOG_DIR``.
-
-    Returns
-    -------
-    dict
-        Parsed JSON payload, or empty dict if none found.
-    """
-    log_dir = config.LOG_DIR
-    if not log_dir.exists():
+def _normalize_metrics(raw: Dict[str, float]) -> Dict[str, float]:
+    """Map persisted metric keys to the API shape expected by the dashboard."""
+    if not raw:
         return {}
 
-    files = sorted(log_dir.glob("metrics_*.json"), reverse=True)
+    def pick(*keys: str) -> float | None:
+        for key in keys:
+            value = raw.get(key)
+            if isinstance(value, (int, float)) and value == value:
+                return float(value)
+        return None
+
+    normalized: Dict[str, float] = {}
+    for key, value in (
+        ("rmse", pick("test_rmse", "rmse")),
+        ("mae", pick("test_mae", "mae")),
+        ("mape", pick("test_mape", "mape")),
+        ("r2", pick("test_r2", "r2")),
+        ("directional_accuracy", pick("test_directional_accuracy", "directional_accuracy")),
+        ("val_rmse", pick("val_rmse")),
+    ):
+        if value is not None:
+            normalized[key] = value
+
+    return normalized
+
+
+def _load_latest_metrics() -> Dict[str, Any]:
+    if not config.LOG_DIR.exists():
+        return {}
+
+    files = sorted(config.LOG_DIR.glob("metrics_*.json"), reverse=True)
     if not files:
         return {}
 
     try:
         with open(files[0], "r", encoding="utf-8") as f:
-            data = json.load(f)
-        logger.info("Loaded latest metrics from %s", files[0].name)
-        return data
+            return json.load(f)
     except Exception as exc:
         logger.error("Error reading metrics file %s: %s", files[0], exc)
         return {}
 
 
+def _flat_feature_names(feature_cols: list[str]) -> list[str]:
+    return [
+        f"{col}_t{step}"
+        for step in range(config.INPUT_SEQUENCE_LENGTH)
+        for col in feature_cols
+    ]
+
+
+def _load_tree_checkpoint() -> tuple[str, Any, list[str] | None]:
+    import joblib
+
+    for name, filename in [
+        ("xgboost", "xgboost.joblib"),
+        ("lightgbm", "lightgbm.joblib"),
+        ("catboost", "catboost.joblib"),
+    ]:
+        ckpt = config.CHECKPOINT_DIR / filename
+        if not ckpt.exists():
+            continue
+
+        payload = joblib.load(ckpt)
+        if isinstance(payload, dict) and "model" in payload:
+            return name, payload["model"], payload.get("feature_names")
+        return name, payload, None
+
+    raise HTTPException(
+        status_code=503,
+        detail="No tree model checkpoint found for SHAP analysis.",
+    )
+
+
 def _run_retraining() -> None:
-    """Background task: execute full training pipeline."""
     logger.info("Background retraining started.")
     try:
         from app.utils.trainer import TrainingOrchestrator
@@ -127,14 +150,8 @@ def _run_retraining() -> None:
         logger.error("Background retraining failed: %s", exc, exc_info=True)
 
 
-# ------------------------------------------------------------------ #
-# Endpoints
-# ------------------------------------------------------------------ #
-
-
 @router.get("/models", response_model=ModelsListResponse)
 async def list_models() -> ModelsListResponse:
-    """List all known models and their latest evaluation metrics."""
     latest = _load_latest_metrics()
     model_metrics: Dict[str, Dict[str, float]] = latest.get("models", {})
     latest_run = latest.get("timestamp")
@@ -148,23 +165,20 @@ async def list_models() -> ModelsListResponse:
         summaries.append(
             ModelSummary(
                 name=name,
-                metrics=model_metrics.get(name, {}),
+                metrics=_normalize_metrics(model_metrics.get(name, {})),
                 checkpoint_exists=ckpt_exists,
             )
         )
 
-    return ModelsListResponse(models=summaries, latest_run=latest_run)
+    return ModelsListResponse(
+        models=summaries,
+        latest_run=latest_run,
+        best_model=latest.get("best_model"),
+    )
 
 
 @router.get("/models/{name}/metrics", response_model=MetricsDetailResponse)
 async def model_metrics(name: str) -> MetricsDetailResponse:
-    """Return detailed metrics for a specific model.
-
-    Parameters
-    ----------
-    name : str
-        Model identifier (e.g. ``transformer``, ``xgboost``, ``ensemble``).
-    """
     if name not in _KNOWN_MODELS:
         raise HTTPException(
             status_code=404,
@@ -182,61 +196,51 @@ async def model_metrics(name: str) -> MetricsDetailResponse:
 
     return MetricsDetailResponse(
         name=name,
-        metrics=model_metrics_map[name],
+        metrics=_normalize_metrics(model_metrics_map[name]),
     )
 
 
 @router.get("/explainability/shap", response_model=ShapResponse)
 async def shap_importance() -> ShapResponse:
-    """Return SHAP-based feature importance for the best tree model."""
     try:
-        import joblib
         import numpy as np
+        import pandas as pd
 
         from app.explainability.shap_explainer import ShapExplainer
+        from app.pipeline.preprocessor import create_tabular_dataset, preprocess_data
 
-        # Try to load a pre-computed SHAP result
         shap_cache = config.LOG_DIR / "shap_results.json"
         if shap_cache.exists():
             with open(shap_cache, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            return ShapResponse(**cached)
+            if cached.get("feature_importance"):
+                return ShapResponse(**cached)
 
-        # Otherwise compute on the fly for the first available tree model
-        for name, filename in [
-            ("xgboost", "xgboost.joblib"),
-            ("lightgbm", "lightgbm.joblib"),
-            ("catboost", "catboost.joblib"),
-        ]:
-            ckpt = config.CHECKPOINT_DIR / filename
-            if ckpt.exists():
-                model = joblib.load(ckpt)
-                break
-        else:
-            raise HTTPException(
-                status_code=503,
-                detail="No tree model checkpoint found for SHAP analysis.",
-            )
-
-        # Load a sample of data
-        import pandas as pd
+        model_name, model, saved_feature_names = _load_tree_checkpoint()
 
         if not config.FEATURES_FILE.exists():
             raise HTTPException(status_code=503, detail="Feature data not available.")
 
-        df = pd.read_parquet(config.FEATURES_FILE)
-        feature_cols = [c for c in df.columns if c != config.TARGET_COLUMN]
-        X_sample = df[feature_cols].dropna().tail(200).values.astype(np.float32)
+        features_df = pd.read_parquet(config.FEATURES_FILE)
+        _, _, test_scaled, feature_cols, target_idx, _ = preprocess_data(features_df)
+        X_sample, _ = create_tabular_dataset(test_scaled, target_idx=target_idx)
+        X_sample = X_sample[-200:].astype(np.float32)
 
-        explainer = ShapExplainer(feature_names=feature_cols)
+        feature_names = (
+            saved_feature_names
+            if saved_feature_names and len(saved_feature_names) == X_sample.shape[1]
+            else _flat_feature_names(feature_cols)
+        )
+
+        explainer = ShapExplainer(feature_names=feature_names)
         explainer.explain_tree_model(model, X_sample)
-
         result = explainer.to_json()
 
-        # Cache for future requests
+        config.LOG_DIR.mkdir(parents=True, exist_ok=True)
         with open(shap_cache, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
 
+        logger.info("SHAP response generated from %s", model_name)
         return ShapResponse(**result)
 
     except HTTPException:
@@ -248,54 +252,61 @@ async def shap_importance() -> ShapResponse:
 
 @router.get("/explainability/attention", response_model=AttentionResponse)
 async def attention_heatmap() -> AttentionResponse:
-    """Return temporal attention importance from the Transformer model."""
     try:
+        import joblib
         import numpy as np
+        import pandas as pd
+        import torch
 
         from app.explainability.attention_viz import AttentionVisualizer
+        from app.models import GoldTransformer
 
-        # Try pre-computed cache
         attn_cache = config.LOG_DIR / "attention_results.json"
         if attn_cache.exists():
             with open(attn_cache, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            return AttentionResponse(**cached)
+            if cached.get("temporal_importance"):
+                return AttentionResponse(**cached)
 
-        # Load Transformer checkpoint
         transformer_ckpt = config.CHECKPOINT_DIR / "transformer.pt"
-        if not transformer_ckpt.exists():
-            transformer_ckpt = config.CHECKPOINT_DIR / "transformer.pth"
         if not transformer_ckpt.exists():
             raise HTTPException(
                 status_code=503,
                 detail="Transformer checkpoint not found for attention analysis.",
             )
-
-        import torch
-
-        from app.models.transformer import TransformerForecaster
-
-        model = torch.load(transformer_ckpt, map_location="cpu")
-        model.eval()
-
-        # Load sample input
-        import pandas as pd
-
         if not config.FEATURES_FILE.exists():
             raise HTTPException(status_code=503, detail="Feature data not available.")
+        if not config.SCALER_FILE.exists():
+            raise HTTPException(status_code=503, detail="Scaler not available.")
+
+        checkpoint = torch.load(transformer_ckpt, map_location="cpu")
+        feature_cols = checkpoint.get("feature_cols")
+        num_features = int(checkpoint["num_features"])
 
         df = pd.read_parquet(config.FEATURES_FILE)
-        feature_cols = [c for c in df.columns if c != config.TARGET_COLUMN]
-        recent = df[feature_cols].dropna().tail(config.INPUT_SEQUENCE_LENGTH)
-        X_sample = recent.values.astype(np.float32)[np.newaxis, :, :]
+        df.ffill(inplace=True)
+        df.dropna(inplace=True)
+
+        if not feature_cols:
+            feature_cols = list(df.columns)
+            feature_cols.remove(config.TARGET_COLUMN)
+            feature_cols.append(config.TARGET_COLUMN)
+
+        recent = df[feature_cols].tail(config.INPUT_SEQUENCE_LENGTH)
+        scaler = joblib.load(config.SCALER_FILE)
+        X_sample = scaler.transform(recent.values.astype(np.float64))
+        X_sample = X_sample.astype(np.float32)[np.newaxis, :, :]
+
+        model = GoldTransformer(num_features=num_features)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
 
         viz = AttentionVisualizer()
         viz.extract_attention(model, X_sample)
         viz.get_temporal_importance()
-
         result = viz.to_json()
 
-        # Cache
+        config.LOG_DIR.mkdir(parents=True, exist_ok=True)
         with open(attn_cache, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
 
@@ -310,7 +321,6 @@ async def attention_heatmap() -> AttentionResponse:
 
 @router.post("/retrain", response_model=RetrainResponse)
 async def retrain(background_tasks: BackgroundTasks) -> RetrainResponse:
-    """Trigger full retraining pipeline in the background."""
     logger.info("Retraining requested via API.")
     background_tasks.add_task(_run_retraining)
     return RetrainResponse()

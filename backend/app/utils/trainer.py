@@ -1,8 +1,7 @@
 """
 Gold Price Forecasting System — Training Orchestrator
 
-Coordinates the full training pipeline: data download → feature engineering →
-preprocessing → model training → ensemble → evaluation.
+Coordinates data download → features → preprocessing → model training → evaluation.
 """
 
 from __future__ import annotations
@@ -10,381 +9,516 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from app import config
-from app.utils.metrics import (
-    compute_all_metrics,
-    compute_per_horizon_metrics,
-    format_metrics_table,
-)
+from app.utils.metrics import compute_all_metrics, format_metrics_table
 
 logger = logging.getLogger(__name__)
 
+_SERVEABLE = ("transformer", "lstm", "xgboost", "lightgbm", "catboost", "ensemble")
+
 
 class TrainingOrchestrator:
-    """End-to-end training orchestrator for all gold-price forecasting models.
-
-    Parameters
-    ----------
-    device : str, optional
-        PyTorch device string. Auto-detected when *None*.
-    """
+    """End-to-end training for all gold-price forecasting models."""
 
     def __init__(self, device: Optional[str] = None) -> None:
         self.device = device or self._detect_device()
         self.results: Dict[str, Dict[str, float]] = {}
-        self._trained_models: Dict[str, Any] = {}
+        self._torch_device = torch.device(self.device)
         logger.info("TrainingOrchestrator init — device=%s", self.device)
-
-    # ------------------------------------------------------------------ #
-    # Device detection
-    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _detect_device() -> str:
-        """Return ``'cuda'`` if a CUDA GPU is available, otherwise ``'cpu'``."""
         try:
-            import torch
-
             if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                logger.info("CUDA GPU detected: %s", gpu_name)
+                logger.info("CUDA GPU detected: %s", torch.cuda.get_device_name(0))
                 return "cuda"
-        except ImportError:
-            logger.warning("PyTorch not installed — falling back to CPU.")
+        except Exception:
+            pass
         return "cpu"
 
-    # ------------------------------------------------------------------ #
-    # Full pipeline
-    # ------------------------------------------------------------------ #
-
-    def run_full_pipeline(self) -> Dict[str, Dict[str, float]]:
-        """Execute the complete training pipeline.
-
-        Steps:
-        1. Download / update market data.
-        2. Engineer features.
-        3. Preprocess (scale, create sequences).
-        4. Train deep-learning models (Transformer, LSTM).
-        5. Train tree-based models (XGBoost, LightGBM, CatBoost).
-        6. Train stacking ensemble.
-        7. Evaluate all models.
-        8. Persist results.
-
-        Returns
-        -------
-        dict
-            ``{model_name: {metric_name: value, …}, …}`` for all models.
-        """
+    def run_full_pipeline(self, *, refresh_data: bool = False) -> Dict[str, Dict[str, float]]:
+        """Execute download → features → preprocess → train → evaluate → save metrics."""
         t0 = time.perf_counter()
         logger.info("=" * 60)
         logger.info("FULL TRAINING PIPELINE — START")
         logger.info("=" * 60)
 
-        # Step 1 — Data download
-        logger.info("[1/8] Downloading market data …")
-        try:
-            from app.pipeline.data_downloader import download_all_data
+        features_df = self._prepare_data(refresh_data=refresh_data)
+        (
+            train_scaled,
+            val_scaled,
+            test_scaled,
+            feature_cols,
+            target_idx,
+        ) = self._preprocess(features_df)
+        datasets = self._build_datasets(
+            train_scaled, val_scaled, test_scaled, target_idx
+        )
 
-            download_all_data()
-        except ImportError:
-            logger.warning("data_downloader not available — skipping download step.")
+        flat_feature_names = [
+            f"{col}_t{step}"
+            for step in range(config.INPUT_SEQUENCE_LENGTH)
+            for col in feature_cols
+        ]
 
-        # Step 2 — Feature engineering
-        logger.info("[2/8] Engineering features …")
-        try:
-            from app.pipeline.feature_engineer import engineer_features
-
-            engineer_features()
-        except ImportError:
-            logger.warning("feature_engineer not available — skipping feature step.")
-
-        # Step 3 — Preprocessing
-        logger.info("[3/8] Preprocessing data …")
-        try:
-            from app.pipeline.preprocessor import preprocess_data
-
-            preprocess_data()
-        except ImportError:
-            logger.warning("preprocessor not available — skipping preprocess step.")
-
-        # Step 4 — Deep models
-        logger.info("[4/8] Training deep-learning models …")
-        self.train_deep_models()
-
-        # Step 5 — Tree models
-        logger.info("[5/8] Training tree-based models …")
-        self.train_tree_models()
-
-        # Step 6 — Ensemble
-        logger.info("[6/8] Training ensemble …")
-        self.train_ensemble()
-
-        # Step 7 — Evaluate
-        logger.info("[7/8] Evaluating all models …")
-        self.results = self.evaluate_all()
-
-        # Step 8 — Save
-        logger.info("[8/8] Saving results …")
+        self._train_tree_models(datasets, flat_feature_names)
+        dl_models = self._train_deep_models(datasets, feature_cols)
+        self._train_ensemble(datasets, dl_models)
+        self.results = self._evaluate_all(datasets, dl_models)
         self.save_results(self.results)
 
-        elapsed = time.perf_counter() - t0
-        logger.info("FULL PIPELINE COMPLETE — %.1f s", elapsed)
+        logger.info("FULL PIPELINE COMPLETE — %.1f s", time.perf_counter() - t0)
         return self.results
 
-    # ------------------------------------------------------------------ #
-    # Deep-learning models
-    # ------------------------------------------------------------------ #
+    def _prepare_data(self, *, refresh_data: bool) -> Any:
+        import pandas as pd
 
-    def train_deep_models(self) -> None:
-        """Train Transformer and LSTM models."""
-        # --- Transformer ---
-        try:
-            from app.models.transformer import TransformerForecaster
-            from app.pipeline.preprocessor import load_processed_data
+        from app.pipeline.data_ingestion import download_all_data, load_raw_data
+        from app.pipeline.feature_engineering import engineer_features, load_features
 
-            logger.info("Loading processed data for Transformer …")
-            data = load_processed_data()
-            train_loader = data["train_loader"]
-            val_loader = data["val_loader"]
-            num_features = data["num_features"]
+        if refresh_data or not config.RAW_DATA_FILE.exists():
+            logger.info("[1/6] Downloading market data …")
+            raw_df = download_all_data()
+        else:
+            logger.info("[1/6] Loading cached raw data …")
+            raw_df = load_raw_data()
 
-            model = TransformerForecaster(
-                num_features=num_features,
-                config=config.TRANSFORMER_CONFIG,
-            )
+        if refresh_data or not config.FEATURES_FILE.exists():
+            logger.info("[2/6] Engineering features …")
+            return engineer_features(raw_df)
+
+        logger.info("[2/6] Loading cached features …")
+        return load_features()
+
+    def _preprocess(self, features_df: Any) -> Tuple[np.ndarray, ...]:
+        from app.pipeline.preprocessor import preprocess_data
+
+        logger.info("[3/6] Preprocessing …")
+        train_scaled, val_scaled, test_scaled, feature_cols, target_idx, _ = (
+            preprocess_data(features_df)
+        )
+        return train_scaled, val_scaled, test_scaled, feature_cols, target_idx
+
+    def _build_datasets(
+        self,
+        train_scaled: np.ndarray,
+        val_scaled: np.ndarray,
+        test_scaled: np.ndarray,
+        target_idx: int,
+    ) -> Dict[str, Any]:
+        from app.pipeline.preprocessor import (
+            create_sequences,
+            create_tabular_dataset,
+            get_dataloaders,
+        )
+
+        loaders = get_dataloaders(
+            train_scaled, val_scaled, test_scaled, target_idx=target_idx
+        )
+        X_train, y_train = create_tabular_dataset(train_scaled, target_idx=target_idx)
+        X_val, y_val = create_tabular_dataset(val_scaled, target_idx=target_idx)
+        X_test, y_test = create_tabular_dataset(test_scaled, target_idx=target_idx)
+
+        X_val_seq, y_val_seq = create_sequences(val_scaled, target_idx=target_idx)
+        X_test_seq, y_test_seq = create_sequences(test_scaled, target_idx=target_idx)
+
+        return {
+            "loaders": loaders,
+            "X_train": X_train,
+            "y_train": y_train,
+            "X_val": X_val,
+            "y_val": y_val,
+            "X_test": X_test,
+            "y_test": y_test,
+            "X_val_seq": X_val_seq,
+            "y_val_seq": y_val_seq,
+            "X_test_seq": X_test_seq,
+            "y_test_seq": y_test_seq,
+            "num_features": train_scaled.shape[1],
+        }
+
+    def _train_tree_models(
+        self, datasets: Dict[str, Any], flat_feature_names: List[str]
+    ) -> Dict[str, Any]:
+        from app.models import CatBoostModel, LightGBMModel, XGBoostModel
+
+        logger.info("[4/6] Training tree models …")
+        models: Dict[str, Any] = {}
+        eval_set = [(datasets["X_val"], datasets["y_val"])]
+
+        for name, cls, filename in [
+            ("xgboost", XGBoostModel, "xgboost.joblib"),
+            ("lightgbm", LightGBMModel, "lightgbm.joblib"),
+            ("catboost", CatBoostModel, "catboost.joblib"),
+        ]:
+            logger.info("  Training %s …", name)
+            model = cls()
             model.fit(
-                train_loader,
-                val_loader,
-                device=self.device,
+                datasets["X_train"],
+                datasets["y_train"],
+                eval_set=eval_set,
+                feature_names=flat_feature_names,
             )
-            self._trained_models["transformer"] = model
-            logger.info("Transformer training complete.")
+            model.save(config.CHECKPOINT_DIR / filename)
+            models[name] = model
 
-        except ImportError:
-            logger.warning("Transformer module not available — skipping.")
-        except Exception as exc:
-            logger.error("Transformer training failed: %s", exc, exc_info=True)
+        return models
 
-        # --- LSTM ---
+    def _train_deep_models(
+        self, datasets: Dict[str, Any], feature_cols: List[str]
+    ) -> Dict[str, Any]:
+        from app.models import GoldLSTM, GoldTransformer, train_rnn, train_transformer
+
+        logger.info("[5/6] Training deep models …")
+        loaders = datasets["loaders"]
+        num_features = datasets["num_features"]
+        models: Dict[str, Any] = {}
+
+        lstm = GoldLSTM(num_features=num_features)
+        train_rnn(
+            lstm,
+            loaders["train"],
+            loaders["val"],
+            device=self._torch_device,
+        )
+        torch.save(
+            {
+                "model_state_dict": lstm.state_dict(),
+                "num_features": num_features,
+                "feature_cols": feature_cols,
+            },
+            config.CHECKPOINT_DIR / "lstm.pt",
+        )
+        models["lstm"] = lstm
+
+        transformer = GoldTransformer(num_features=num_features)
+        train_transformer(
+            transformer,
+            loaders["train"],
+            loaders["val"],
+            device=self._torch_device,
+        )
+        torch.save(
+            {
+                "model_state_dict": transformer.state_dict(),
+                "num_features": num_features,
+                "feature_cols": feature_cols,
+            },
+            config.CHECKPOINT_DIR / "transformer.pt",
+        )
+        models["transformer"] = transformer
+
+        return models
+
+    @staticmethod
+    def _ensemble_tabular_from_sequences(X_seq: np.ndarray) -> np.ndarray:
+        """Flatten sequence windows to match boosting model input layout."""
+        return X_seq.reshape(X_seq.shape[0], -1).astype(np.float32)
+
+    def _train_ensemble(
+        self, datasets: Dict[str, Any], dl_models: Dict[str, Any]
+    ) -> None:
+        from app.models import StackingEnsemble
+
+        logger.info("[6/6] Training stacking ensemble …")
         try:
-            from app.models.lstm import LSTMForecaster
-            from app.pipeline.preprocessor import load_processed_data
+            from app.models import CatBoostModel, LightGBMModel, XGBoostModel
 
-            data = load_processed_data()
-            train_loader = data["train_loader"]
-            val_loader = data["val_loader"]
-            num_features = data["num_features"]
-
-            model = LSTMForecaster(
-                num_features=num_features,
-                config=config.RNN_CONFIG,
+            ensemble = StackingEnsemble(
+                transformer=dl_models["transformer"],
+                lstm=dl_models["lstm"],
+                xgb_model=XGBoostModel().load(config.CHECKPOINT_DIR / "xgboost.joblib"),
+                lgb_model=LightGBMModel().load(config.CHECKPOINT_DIR / "lightgbm.joblib"),
+                cat_model=CatBoostModel().load(config.CHECKPOINT_DIR / "catboost.joblib"),
+                device=self._torch_device,
             )
-            model.fit(
-                train_loader,
-                val_loader,
-                device=self.device,
+            x_val_tab = self._ensemble_tabular_from_sequences(datasets["X_val_seq"])
+            ensemble.fit_meta_learner(
+                datasets["X_val_seq"],
+                x_val_tab,
+                datasets["y_val_seq"],
             )
-            self._trained_models["lstm"] = model
-            logger.info("LSTM training complete.")
-
-        except ImportError:
-            logger.warning("LSTM module not available — skipping.")
-        except Exception as exc:
-            logger.error("LSTM training failed: %s", exc, exc_info=True)
-
-    # ------------------------------------------------------------------ #
-    # Tree-based models
-    # ------------------------------------------------------------------ #
-
-    def train_tree_models(self) -> None:
-        """Train XGBoost, LightGBM, and CatBoost models."""
-        try:
-            from app.pipeline.preprocessor import load_processed_data
-
-            data = load_processed_data()
-            X_train = data["X_train_flat"]
-            y_train = data["y_train_flat"]
-            X_val = data["X_val_flat"]
-            y_val = data["y_val_flat"]
-        except (ImportError, KeyError) as exc:
-            logger.error("Cannot load flat training data: %s", exc)
-            return
-
-        # --- XGBoost ---
-        try:
-            from app.models.xgboost_model import XGBoostForecaster
-
-            model = XGBoostForecaster(config=config.XGBOOST_CONFIG)
-            model.fit(X_train, y_train, X_val, y_val)
-            self._trained_models["xgboost"] = model
-            logger.info("XGBoost training complete.")
-        except ImportError:
-            logger.warning("XGBoost module not available — skipping.")
-        except Exception as exc:
-            logger.error("XGBoost training failed: %s", exc, exc_info=True)
-
-        # --- LightGBM ---
-        try:
-            from app.models.lightgbm_model import LightGBMForecaster
-
-            model = LightGBMForecaster(config=config.LIGHTGBM_CONFIG)
-            model.fit(X_train, y_train, X_val, y_val)
-            self._trained_models["lightgbm"] = model
-            logger.info("LightGBM training complete.")
-        except ImportError:
-            logger.warning("LightGBM module not available — skipping.")
-        except Exception as exc:
-            logger.error("LightGBM training failed: %s", exc, exc_info=True)
-
-        # --- CatBoost ---
-        try:
-            from app.models.catboost_model import CatBoostForecaster
-
-            model = CatBoostForecaster(config=config.CATBOOST_CONFIG)
-            model.fit(X_train, y_train, X_val, y_val)
-            self._trained_models["catboost"] = model
-            logger.info("CatBoost training complete.")
-        except ImportError:
-            logger.warning("CatBoost module not available — skipping.")
-        except Exception as exc:
-            logger.error("CatBoost training failed: %s", exc, exc_info=True)
-
-    # ------------------------------------------------------------------ #
-    # Ensemble
-    # ------------------------------------------------------------------ #
-
-    def train_ensemble(self) -> None:
-        """Train a stacking ensemble over all individual model predictions."""
-        if not self._trained_models:
-            logger.warning("No trained models available — cannot build ensemble.")
-            return
-
-        try:
-            from app.models.ensemble import EnsembleForecaster
-            from app.pipeline.preprocessor import load_processed_data
-
-            data = load_processed_data()
-            X_val = data.get("X_val_flat", data.get("X_val"))
-            y_val = data.get("y_val_flat", data.get("y_val"))
-
-            if X_val is None or y_val is None:
-                logger.error("Validation data unavailable — cannot train ensemble.")
-                return
-
-            ensemble = EnsembleForecaster(
-                models=self._trained_models,
-                config=config.ENSEMBLE_CONFIG,
-            )
-            ensemble.fit(X_val, y_val)
-            self._trained_models["ensemble"] = ensemble
-            logger.info("Ensemble training complete (%d base models).",
-                        len(self._trained_models) - 1)
-
-        except ImportError:
-            logger.warning("Ensemble module not available — skipping.")
+            ensemble.save(config.CHECKPOINT_DIR / "ensemble.joblib")
+            logger.info("Ensemble meta-learner saved.")
         except Exception as exc:
             logger.error("Ensemble training failed: %s", exc, exc_info=True)
 
-    # ------------------------------------------------------------------ #
-    # Evaluation
-    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _predict_deep(model: Any, X: np.ndarray, device: torch.device) -> np.ndarray:
+        model.eval().to(device)
+        batch_size = config.TRANSFORMER_CONFIG["batch_size"]
+        chunks: list[np.ndarray] = []
 
-    def evaluate_all(self) -> Dict[str, Dict[str, float]]:
-        """Evaluate every trained model on the test set.
+        with torch.no_grad():
+            for start in range(0, len(X), batch_size):
+                batch = torch.tensor(
+                    X[start : start + batch_size], dtype=torch.float32, device=device
+                )
+                output = model(batch)
+                if isinstance(output, dict):
+                    output = output["q50"]
+                chunks.append(output.cpu().numpy())
 
-        Returns
-        -------
-        dict
-            ``{model_name: {metric_name: value}}``.
-        """
-        if not self._trained_models:
-            logger.warning("No trained models to evaluate.")
-            return {}
+        return np.concatenate(chunks, axis=0)
 
-        try:
-            from app.pipeline.preprocessor import load_processed_data
+    def _evaluate_all(
+        self, datasets: Dict[str, Any], dl_models: Dict[str, Any]
+    ) -> Dict[str, Dict[str, float]]:
+        from app.models import CatBoostModel, LightGBMModel, XGBoostModel
 
-            data = load_processed_data()
-        except (ImportError, Exception) as exc:
-            logger.error("Cannot load test data for evaluation: %s", exc)
-            return {}
-
-        # Support both sequential and flat test data
-        X_test_seq = data.get("X_test")
-        y_test_seq = data.get("y_test")
-        X_test_flat = data.get("X_test_flat")
-        y_test_flat = data.get("y_test_flat")
-
+        logger.info("Evaluating models on validation and test splits …")
         results: Dict[str, Dict[str, float]] = {}
 
-        for name, model in self._trained_models.items():
-            logger.info("Evaluating model: %s", name)
+        tree_models = {
+            "xgboost": XGBoostModel().load(config.CHECKPOINT_DIR / "xgboost.joblib"),
+            "lightgbm": LightGBMModel().load(config.CHECKPOINT_DIR / "lightgbm.joblib"),
+            "catboost": CatBoostModel().load(config.CHECKPOINT_DIR / "catboost.joblib"),
+        }
+
+        for name, model in tree_models.items():
+            val_pred = model.predict(datasets["X_val"])
+            test_pred = model.predict(datasets["X_test"])
+            results[name] = self._metric_bundle(
+                datasets["y_val"], val_pred, datasets["y_test"], test_pred
+            )
+
+        for name in ("lstm", "transformer"):
+            model = dl_models[name]
+            val_pred = self._predict_deep(model, datasets["X_val_seq"], self._torch_device)
+            test_pred = self._predict_deep(model, datasets["X_test_seq"], self._torch_device)
+            results[name] = self._metric_bundle(
+                datasets["y_val_seq"], val_pred, datasets["y_test_seq"], test_pred
+            )
+
+        ensemble_path = config.CHECKPOINT_DIR / "ensemble.joblib"
+        if ensemble_path.exists():
             try:
-                # Deep models expect sequential input
-                if name in ("transformer", "lstm"):
-                    if X_test_seq is None or y_test_seq is None:
-                        logger.warning("Sequential test data missing for %s.", name)
-                        continue
-                    preds = model.predict(X_test_seq)
-                    y_true = np.asarray(y_test_seq)
-                else:
-                    if X_test_flat is None or y_test_flat is None:
-                        logger.warning("Flat test data missing for %s.", name)
-                        continue
-                    preds = model.predict(X_test_flat)
-                    y_true = np.asarray(y_test_flat)
+                from app.models.ensemble import load_stacking_ensemble
 
-                preds = np.asarray(preds)
-                metrics = compute_all_metrics(y_true, preds)
-                results[name] = metrics
-                logger.info("  %s: RMSE=%.4f  MAE=%.4f  MAPE=%.2f%%  R²=%.4f",
-                            name, metrics["rmse"], metrics["mae"],
-                            metrics["mape"], metrics["r2"])
-
+                ensemble = load_stacking_ensemble(self._torch_device)
+                x_val_tab = self._ensemble_tabular_from_sequences(datasets["X_val_seq"])
+                x_test_tab = self._ensemble_tabular_from_sequences(datasets["X_test_seq"])
+                val_pred = ensemble.predict(datasets["X_val_seq"], x_val_tab)
+                test_pred = ensemble.predict(datasets["X_test_seq"], x_test_tab)
+                results["ensemble"] = self._metric_bundle(
+                    datasets["y_val_seq"], val_pred, datasets["y_test_seq"], test_pred
+                )
             except Exception as exc:
-                logger.error("Evaluation failed for %s: %s", name, exc, exc_info=True)
+                logger.error("Ensemble evaluation failed: %s", exc, exc_info=True)
 
         if results:
-            table = format_metrics_table(results)
-            logger.info("\n%s", table)
+            logger.info("\n%s", format_metrics_table(
+                {k: {"rmse": v.get("val_rmse", v.get("rmse", 0))} for k, v in results.items()}
+            ))
 
         return results
 
-    # ------------------------------------------------------------------ #
-    # Persistence
-    # ------------------------------------------------------------------ #
+    def build_ensemble_from_checkpoints(self) -> Path:
+        """Fit the stacking meta-learner from existing base model checkpoints."""
+        import pandas as pd
+
+        from app.pipeline.preprocessor import preprocess_data
+
+        if not config.FEATURES_FILE.exists():
+            raise FileNotFoundError(f"Feature file not found: {config.FEATURES_FILE}")
+
+        for name in ("transformer", "lstm", "xgboost", "lightgbm", "catboost"):
+            if not (config.CHECKPOINT_DIR / (
+                f"{name}.pt" if name in ("transformer", "lstm") else f"{name}.joblib"
+            )).exists():
+                raise FileNotFoundError(
+                    f"Missing base model '{name}'. Train all base models first."
+                )
+
+        features_df = pd.read_parquet(config.FEATURES_FILE)
+        train_scaled, val_scaled, test_scaled, _, target_idx, _ = preprocess_data(
+            features_df
+        )
+        datasets = self._build_datasets(
+            train_scaled, val_scaled, test_scaled, target_idx
+        )
+
+        logger.info("Fitting ensemble meta-learner on validation split …")
+        from app.models import (
+            CatBoostModel,
+            GoldLSTM,
+            GoldTransformer,
+            LightGBMModel,
+            XGBoostModel,
+            StackingEnsemble,
+        )
+
+        transformer_ckpt = torch.load(
+            config.CHECKPOINT_DIR / "transformer.pt", map_location="cpu"
+        )
+        lstm_ckpt = torch.load(config.CHECKPOINT_DIR / "lstm.pt", map_location="cpu")
+        num_features = int(transformer_ckpt["num_features"])
+
+        transformer = GoldTransformer(num_features=num_features)
+        transformer.load_state_dict(transformer_ckpt["model_state_dict"])
+        lstm = GoldLSTM(num_features=num_features)
+        lstm.load_state_dict(lstm_ckpt["model_state_dict"])
+
+        ensemble = StackingEnsemble(
+            transformer=transformer,
+            lstm=lstm,
+            xgb_model=XGBoostModel().load(config.CHECKPOINT_DIR / "xgboost.joblib"),
+            lgb_model=LightGBMModel().load(config.CHECKPOINT_DIR / "lightgbm.joblib"),
+            cat_model=CatBoostModel().load(config.CHECKPOINT_DIR / "catboost.joblib"),
+            device=self._torch_device,
+        )
+        x_val_tab = self._ensemble_tabular_from_sequences(datasets["X_val_seq"])
+        ensemble.fit_meta_learner(
+            datasets["X_val_seq"],
+            x_val_tab,
+            datasets["y_val_seq"],
+        )
+        out_path = config.CHECKPOINT_DIR / "ensemble.joblib"
+        ensemble.save(out_path)
+        logger.info("Ensemble saved to %s", out_path)
+
+        self.results = self.evaluate_existing_checkpoints()
+        return out_path
 
     def save_results(self, results: Dict[str, Dict[str, float]]) -> Path:
-        """Save evaluation results to a timestamped JSON in ``config.LOG_DIR``.
-
-        Parameters
-        ----------
-        results : dict
-            ``{model_name: {metric_name: value}}``.
-
-        Returns
-        -------
-        Path
-            Path to the saved JSON file.
-        """
         config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_path = config.LOG_DIR / f"metrics_{timestamp}.json"
+
+        best_model = None
+        best_val = float("inf")
+        for name in _SERVEABLE:
+            val_rmse = results.get(name, {}).get("val_rmse")
+            if isinstance(val_rmse, (int, float)) and val_rmse < best_val:
+                best_val = float(val_rmse)
+                best_model = name
 
         payload = {
             "timestamp": timestamp,
             "device": self.device,
+            "best_model": best_model,
             "models": results,
         }
 
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, default=str)
+        with open(out_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, default=str)
 
-        logger.info("Metrics saved to %s", out_path)
+        logger.info("Metrics saved to %s (best_model=%s)", out_path, best_model)
         return out_path
+
+    def evaluate_existing_checkpoints(self) -> Dict[str, Dict[str, float]]:
+        """Evaluate saved checkpoints without retraining (writes metrics JSON)."""
+        import pandas as pd
+
+        from app.pipeline.preprocessor import (
+            create_sequences,
+            create_tabular_dataset,
+            preprocess_data,
+        )
+
+        if not config.FEATURES_FILE.exists():
+            raise FileNotFoundError(
+                f"Feature file not found: {config.FEATURES_FILE}. Run training first."
+            )
+
+        features_df = pd.read_parquet(config.FEATURES_FILE)
+        train_scaled, val_scaled, test_scaled, feature_cols, target_idx, _ = (
+            preprocess_data(features_df)
+        )
+        datasets = self._build_datasets(
+            train_scaled, val_scaled, test_scaled, target_idx
+        )
+
+        from app.models import (
+            CatBoostModel,
+            GoldLSTM,
+            GoldTransformer,
+            LightGBMModel,
+            XGBoostModel,
+        )
+
+        results: Dict[str, Dict[str, float]] = {}
+
+        for name, cls, filename in [
+            ("xgboost", XGBoostModel, "xgboost.joblib"),
+            ("lightgbm", LightGBMModel, "lightgbm.joblib"),
+            ("catboost", CatBoostModel, "catboost.joblib"),
+        ]:
+            path = config.CHECKPOINT_DIR / filename
+            if not path.exists():
+                continue
+            model = cls().load(path)
+            val_pred = model.predict(datasets["X_val"])
+            test_pred = model.predict(datasets["X_test"])
+            results[name] = self._metric_bundle(
+                datasets["y_val"], val_pred, datasets["y_test"], test_pred
+            )
+
+        for name, cls, filename in [
+            ("lstm", GoldLSTM, "lstm.pt"),
+            ("transformer", GoldTransformer, "transformer.pt"),
+        ]:
+            path = config.CHECKPOINT_DIR / filename
+            if not path.exists():
+                continue
+            ckpt = torch.load(path, map_location="cpu")
+            model = cls(num_features=int(ckpt["num_features"]))
+            model.load_state_dict(ckpt["model_state_dict"])
+            val_pred = self._predict_deep(
+                model, datasets["X_val_seq"], self._torch_device
+            )
+            test_pred = self._predict_deep(
+                model, datasets["X_test_seq"], self._torch_device
+            )
+            results[name] = self._metric_bundle(
+                datasets["y_val_seq"], val_pred, datasets["y_test_seq"], test_pred
+            )
+
+        ensemble_path = config.CHECKPOINT_DIR / "ensemble.joblib"
+        if ensemble_path.exists():
+            try:
+                from app.models.ensemble import load_stacking_ensemble
+
+                ensemble = load_stacking_ensemble(self._torch_device)
+                x_val_tab = self._ensemble_tabular_from_sequences(datasets["X_val_seq"])
+                x_test_tab = self._ensemble_tabular_from_sequences(datasets["X_test_seq"])
+                val_pred = ensemble.predict(datasets["X_val_seq"], x_val_tab)
+                test_pred = ensemble.predict(datasets["X_test_seq"], x_test_tab)
+                results["ensemble"] = self._metric_bundle(
+                    datasets["y_val_seq"], val_pred, datasets["y_test_seq"], test_pred
+                )
+            except Exception as exc:
+                logger.error("Ensemble evaluation failed: %s", exc, exc_info=True)
+
+        if not results:
+            raise FileNotFoundError("No checkpoints found to evaluate.")
+
+        self.results = results
+        return self.save_results(results)
+
+    @staticmethod
+    def _metric_bundle(
+        y_val: np.ndarray,
+        val_pred: np.ndarray,
+        y_test: np.ndarray,
+        test_pred: np.ndarray,
+    ) -> Dict[str, float]:
+        val_metrics = compute_all_metrics(y_val, val_pred)
+        test_metrics = compute_all_metrics(y_test, test_pred)
+        return {
+            **{f"val_{k}": v for k, v in val_metrics.items()},
+            **{f"test_{k}": v for k, v in test_metrics.items()},
+            "val_rmse": val_metrics["rmse"],
+            "rmse": test_metrics["rmse"],
+            "mae": test_metrics["mae"],
+            "mape": test_metrics["mape"],
+            "r2": test_metrics["r2"],
+            "directional_accuracy": test_metrics["directional_accuracy"],
+        }

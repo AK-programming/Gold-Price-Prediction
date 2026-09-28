@@ -136,7 +136,7 @@ def preprocess_data(
     rows_after = len(df)
     if rows_before != rows_after:
         logger.info(
-            "Dropped %d NaN rows (%d → %d)",
+            "Dropped %d NaN rows (%d -> %d)",
             rows_before - rows_after,
             rows_before,
             rows_after,
@@ -398,45 +398,68 @@ def get_dataloaders(
 # Public: inverse transform
 # ------------------------------------------------------------------
 
+def inverse_target_column(
+    scaled_values: np.ndarray,
+    scaler: MinMaxScaler,
+    target_idx: int = -1,
+) -> np.ndarray:
+    """Map scaled target values back to original price units.
+
+    Uses the target column's MinMax parameters only.  Embedding predictions
+    in a zero-filled full feature matrix (``inverse_transform``) is incorrect
+    when other features are non-zero in the real window.
+    """
+    original_shape = scaled_values.shape
+    flat = np.asarray(scaled_values, dtype=np.float64).ravel()
+    data_min = float(scaler.data_min_[target_idx])
+    data_range = float(scaler.data_range_[target_idx])
+    restored = flat * data_range + data_min
+    return restored.reshape(original_shape).astype(np.float32)
+
+
+def prepare_inference_window(
+    df: pd.DataFrame,
+) -> Tuple[np.ndarray, List[str], int, MinMaxScaler, float]:
+    """Build a scaled input window for live forecasting.
+
+    Fits the scaler on the **full** history so prices above the training
+    maximum (e.g. recent gold rallies) stay in a valid range for inference.
+    """
+    df = df.copy()
+    df.ffill(inplace=True)
+    df.dropna(inplace=True)
+
+    all_cols: List[str] = list(df.columns)
+    if config.TARGET_COLUMN not in all_cols:
+        raise ValueError(f"Target column '{config.TARGET_COLUMN}' not found.")
+
+    all_cols.remove(config.TARGET_COLUMN)
+    all_cols.append(config.TARGET_COLUMN)
+    df = df[all_cols]
+
+    if len(df) < config.INPUT_SEQUENCE_LENGTH:
+        raise ValueError(
+            f"Need at least {config.INPUT_SEQUENCE_LENGTH} rows, got {len(df)}."
+        )
+
+    values = df.values.astype(np.float64)
+    inference_scaler = MinMaxScaler(feature_range=(0, 1))
+    inference_scaler.fit(values)
+    scaled = inference_scaler.transform(values)
+
+    target_idx = len(all_cols) - 1
+    recent_scaled = scaled[-config.INPUT_SEQUENCE_LENGTH :].astype(np.float32)
+    current_price = float(df[config.TARGET_COLUMN].iloc[-1])
+
+    return recent_scaled, all_cols, target_idx, inference_scaler, current_price
+
+
 def inverse_transform_predictions(
     predictions: np.ndarray,
     scaler: MinMaxScaler,
     target_idx: int = -1,
     n_features: Optional[int] = None,
 ) -> np.ndarray:
-    """Reverse the MinMax scaling on model predictions.
-
-    Because the scaler was fit on **all** features jointly, we need to
-    embed the predictions into a full-width dummy array, inverse-transform,
-    then extract the target column.
-
-    Parameters
-    ----------
-    predictions:
-        1-D or 2-D array of scaled predictions.  If 2-D, shape should be
-        ``(n_samples, output_len)``.
-    scaler:
-        The fitted ``MinMaxScaler`` from :func:`preprocess_data`.
-    target_idx:
-        Index of the target column in the scaler's feature set.
-    n_features:
-        Total number of features the scaler was fit on.  If ``None``,
-        inferred from ``scaler.n_features_in_``.
-
-    Returns
-    -------
-    np.ndarray
-        Predictions in original (unscaled) price space, same shape as
-        *predictions*.
-    """
-    original_shape = predictions.shape
-    flat = predictions.flatten()
-
-    n_feat = n_features or scaler.n_features_in_
-
-    # Build a dummy array of zeros with the correct width
-    dummy = np.zeros((len(flat), n_feat), dtype=np.float64)
-    dummy[:, target_idx] = flat
-
-    inversed = scaler.inverse_transform(dummy)[:, target_idx]
-    return inversed.reshape(original_shape).astype(np.float32)
+    """Reverse MinMax scaling on target predictions (price space)."""
+    del n_features  # kept for backward compatibility
+    return inverse_target_column(predictions, scaler, target_idx)

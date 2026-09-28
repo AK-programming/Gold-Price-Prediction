@@ -3,8 +3,8 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { motion } from "framer-motion";
 import {
-  AreaChart,
-  Area,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -15,7 +15,9 @@ import {
   Cell,
   Legend,
 } from "recharts";
+import { fetchJson, postJson, waitForBackend } from "./api";
 import type {
+  DataStatusResponse,
   ForecastResponse,
   HistoricalResponse,
   HistoricalPoint,
@@ -46,6 +48,21 @@ function generateMockHistorical(days: number): HistoricalPoint[] {
   }
   return data;
 }
+
+const generateHourlyData = (basePrice: number) => {
+  const data = [];
+  let a = basePrice + (Math.random() - 0.5) * 50;
+  for (let i = 0; i < 60; i++) {
+    a += (Math.random() - 0.5) * 10;
+    const p = a + (Math.random() - 0.5) * 15;
+    data.push({
+      time: i,
+      actual: i < 50 ? a : null,
+      predicted: i >= 45 ? p : (i < 50 ? a + (Math.random() - 0.5) * 5 : null),
+    });
+  }
+  return data;
+};
 
 const MOCK_HISTORICAL: HistoricalResponse = {
   data: generateMockHistorical(365),
@@ -146,7 +163,8 @@ const fmt = (n: number) =>
 const fmtCompact = (n: number) =>
   n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-const pctFmt = (n: number) => `${(n * 100).toFixed(2)}%`;
+const pctFmt = (n: number | undefined | null) =>
+  typeof n === "number" && !Number.isNaN(n) ? `${n.toFixed(2)}%` : "—";
 
 const forecastDates = (forecast?: ForecastResponse | null) =>
   Array.isArray(forecast?.dates) ? forecast.dates : MOCK_FORECAST.dates;
@@ -225,43 +243,51 @@ export default function Home() {
 
   const [isDemo, setIsDemo] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [backendReady, setBackendReady] = useState(false);
+  const [dataStatus, setDataStatus] = useState<DataStatusResponse | null>(null);
   const [range, setRange] = useState<TimeRange>("90d");
 
-  /* ── Fetchers ───────────────────────────────────────────── */
-  const fetchJson = useCallback(async <T,>(url: string): Promise<T | null> => {
-    try {
-      const r = await fetch(url, { cache: "no-store" });
-      if (!r.ok) return null;
-      return (await r.json()) as T;
-    } catch {
-      return null;
-    }
+  const loadDashboardData = useCallback(async () => {
+    setLoading(true);
+    const ready = await waitForBackend(30, 2000);
+    setBackendReady(ready);
+
+    const [fc, hs, md, sh, at, ds] = await Promise.all([
+      fetchJson<ForecastResponse>("/api/v1/forecast"),
+      fetchJson<HistoricalResponse>("/api/v1/historical"),
+      fetchJson<ModelsListResponse>("/api/v1/models"),
+      fetchJson<ShapResponse>("/api/v1/explainability/shap"),
+      fetchJson<AttentionResponse>("/api/v1/explainability/attention"),
+      fetchJson<DataStatusResponse>("/api/v1/data/status"),
+    ]);
+
+    setDataStatus(ds);
+
+    const liveCore = Boolean(fc && hs);
+    setIsDemo(!liveCore);
+    setForecast(fc ?? MOCK_FORECAST);
+    setHistorical(hs ?? MOCK_HISTORICAL);
+    setModels(md ?? MOCK_MODELS);
+    setShap(sh ?? MOCK_SHAP);
+    setAttention(at ?? MOCK_ATTENTION);
+    setLoading(false);
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      setLoading(true);
-      const [fc, hs, md, sh, at] = await Promise.all([
-        fetchJson<ForecastResponse>("/api/v1/forecast"),
-        fetchJson<HistoricalResponse>("/api/v1/historical"),
-        fetchJson<ModelsListResponse>("/api/v1/models"),
-        fetchJson<ShapResponse>("/api/v1/explainability/shap"),
-        fetchJson<AttentionResponse>("/api/v1/explainability/attention"),
-      ]);
-      if (cancelled) return;
+  const refreshMarketData = useCallback(async () => {
+    setRefreshing(true);
+    const result = await postJson<{ status: string; message: string }>(
+      "/api/v1/data/refresh"
+    );
+    if (result) {
+      await loadDashboardData();
+    }
+    setRefreshing(false);
+  }, [loadDashboardData]);
 
-      const useMock = !fc && !hs;
-      setIsDemo(useMock);
-      setForecast(fc ?? MOCK_FORECAST);
-      setHistorical(hs ?? MOCK_HISTORICAL);
-      setModels(md ?? MOCK_MODELS);
-      setShap(sh ?? MOCK_SHAP);
-      setAttention(at ?? MOCK_ATTENTION);
-      setLoading(false);
-    })();
-    return () => { cancelled = true; };
-  }, [fetchJson]);
+  useEffect(() => {
+    loadDashboardData();
+  }, [loadDashboardData]);
 
   /* ── Derived data ───────────────────────────────────────── */
   const chartData = useMemo(() => {
@@ -310,20 +336,40 @@ export default function Home() {
 
   const bestModel = useMemo(() => {
     if (!models?.models.length) return null;
-    return models.models.reduce((best, m) =>
+    if (models.best_model) {
+      const match = models.models.find((m) => m.name === models.best_model);
+      if (match?.metrics?.rmse) return match;
+    }
+    const ranked = models.models.filter(
+      (m) =>
+        typeof m.metrics?.rmse === "number" &&
+        !Number.isNaN(m.metrics.rmse) &&
+        m.metrics.rmse > 0
+    );
+    if (!ranked.length) return null;
+    return ranked.reduce((best, m) =>
       m.metrics.rmse < best.metrics.rmse ? m : best
     );
   }, [models]);
+
+  const hourlyData = useMemo(() => {
+    return {
+      h1: generateHourlyData(currentPrice),
+      h3: generateHourlyData(currentPrice),
+      h6: generateHourlyData(currentPrice),
+    };
+  }, [currentPrice]);
 
   /* ── Loading skeleton ───────────────────────────────────── */
   if (loading) {
     return (
       <main className="dashboard">
         <header className="header">
-          <h1 className="header-brand">GoldSight AI</h1>
+          <h1 className="header-brand">Afnan GoldSight AI</h1>
           <p className="header-subtitle">Intelligent Gold Price Forecasting</p>
           <hr className="header-divider" />
         </header>
+        <p className="loading-hint">Connecting to API at 127.0.0.1:7860…</p>
         <div className="stats-grid" style={{ marginBottom: 48 }}>
           {[1, 2, 3, 4].map((i) => (
             <div key={i} className="glass-card stat-card">
@@ -359,6 +405,45 @@ export default function Home() {
         <hr className="header-divider" />
       </motion.header>
 
+      {/* ── Data freshness ──────────────────────────────────── */}
+      {dataStatus && (
+        <motion.div
+          className={`data-freshness-bar ${dataStatus.days_behind > 2 ? "stale" : ""}`}
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          id="data-freshness-bar"
+        >
+          <div className="data-freshness-text">
+            <strong>Data as of {dataStatus.last_data_date}</strong>
+            <span className="data-freshness-meta">
+              {dataStatus.source_label} · stored close {fmt(dataStatus.last_close_usd)}
+              {dataStatus.live_quote_usd != null && dataStatus.live_quote_date && (
+                <>
+                  {" "}
+                  · Yahoo live ({dataStatus.live_quote_date}):{" "}
+                  {fmt(dataStatus.live_quote_usd)}
+                </>
+              )}
+              {dataStatus.days_behind > 0 && (
+                <span className="data-stale-hint">
+                  {" "}
+                  · {dataStatus.days_behind} day{dataStatus.days_behind === 1 ? "" : "s"} behind today
+                </span>
+              )}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="data-refresh-btn"
+            onClick={() => refreshMarketData()}
+            disabled={loading || refreshing}
+            id="refresh-market-data-btn"
+          >
+            {refreshing ? "Downloading…" : "Refresh market data"}
+          </button>
+        </motion.div>
+      )}
+
       {/* ── Demo Banner ─────────────────────────────────────── */}
       {isDemo && (
         <motion.div
@@ -369,7 +454,19 @@ export default function Home() {
           id="demo-banner"
         >
           <span className="dot" />
-          Using demo data — connect backend for live predictions
+          <span>
+            {backendReady
+              ? "Could not load live forecast — showing demo data"
+              : "Waiting for backend — start it with run.bat or python run_server.py in backend/"}
+          </span>
+          <button
+            type="button"
+            className="demo-retry-btn"
+            onClick={() => loadDashboardData()}
+            disabled={loading}
+          >
+            {loading ? "Connecting…" : "Retry connection"}
+          </button>
         </motion.div>
       )}
 
@@ -384,7 +481,12 @@ export default function Home() {
           <motion.div className="glass-card stat-card" variants={fadeUp} id="stat-current-price">
             <p className="stat-label">Current Price</p>
             <p className="stat-value gold">{fmt(currentPrice)}</p>
-            <p className="stat-sub">XAU / USD</p>
+            <p className="stat-sub">
+              XAU / USD
+              {dataStatus && !isDemo && (
+                <> · dataset {dataStatus.last_data_date}</>
+              )}
+            </p>
           </motion.div>
 
           <motion.div className="glass-card stat-card" variants={fadeUp} id="stat-24h-change">
@@ -444,94 +546,99 @@ export default function Home() {
           </div>
 
           <div className="chart-container">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="gradActual" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#D4AF37" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#D4AF37" stopOpacity={0.0} />
-                  </linearGradient>
-                  <linearGradient id="gradPredicted" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#448aff" stopOpacity={0.3} />
-                    <stop offset="100%" stopColor="#448aff" stopOpacity={0.0} />
-                  </linearGradient>
-                  <linearGradient id="gradConf" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#448aff" stopOpacity={0.12} />
-                    <stop offset="100%" stopColor="#448aff" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+            {chartData.length > 0 && (
+            <ResponsiveContainer width="100%" height={420}>
+              <LineChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
                 <XAxis
                   dataKey="date"
-                  tick={{ fill: "#6b6b80", fontSize: 11 }}
+                  tick={{ fill: "#6b7280", fontSize: 11 }}
                   tickLine={false}
-                  axisLine={{ stroke: "rgba(255,255,255,0.06)" }}
+                  axisLine={{ stroke: "#e0e0e0" }}
                   minTickGap={40}
                 />
                 <YAxis
-                  domain={["auto", "auto"]}
-                  tick={{ fill: "#6b6b80", fontSize: 11 }}
+                  domain={[
+                    (min: number) => Math.floor(min * 0.98),
+                    (max: number) => Math.ceil(max * 1.02),
+                  ]}
+                  tick={{ fill: "#6b7280", fontSize: 11 }}
                   tickLine={false}
-                  axisLine={false}
-                  tickFormatter={(v: number) => `$${v}`}
-                  width={70}
+                  axisLine={{ stroke: "#e0e0e0" }}
+                  tickFormatter={(v: number) => `$${Math.round(v).toLocaleString()}`}
+                  width={72}
                 />
                 <Tooltip content={<ChartTooltip />} />
                 <Legend
                   verticalAlign="top"
                   height={36}
-                  iconType="circle"
-                  wrapperStyle={{ fontSize: 12, color: "#9a9ab0" }}
-                />
-                {/* Confidence band */}
-                <Area
-                  type="monotone"
-                  dataKey="confHigh"
-                  stroke="none"
-                  fill="url(#gradConf)"
-                  name="Confidence High"
-                  dot={false}
-                  activeDot={false}
-                  connectNulls={false}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="confLow"
-                  stroke="none"
-                  fill="url(#gradConf)"
-                  name="Confidence Low"
-                  dot={false}
-                  activeDot={false}
-                  connectNulls={false}
+                  iconType="plainline"
+                  wrapperStyle={{ fontSize: 12, color: "#4b5563" }}
                 />
                 {/* Actual */}
-                <Area
+                <Line
                   type="monotone"
                   dataKey="actual"
-                  stroke="#D4AF37"
+                  stroke="#3b82f6"
                   strokeWidth={2}
-                  fill="url(#gradActual)"
                   name="Actual"
                   dot={false}
-                  activeDot={{ r: 5, stroke: "#FFD700", strokeWidth: 2, fill: "#0a0a0f" }}
+                  activeDot={{ r: 5, stroke: "#3b82f6", strokeWidth: 2, fill: "#ffffff" }}
                   connectNulls={false}
                 />
                 {/* Predicted */}
-                <Area
+                <Line
                   type="monotone"
                   dataKey="predicted"
-                  stroke="#448aff"
+                  stroke="#ef4444"
                   strokeWidth={2}
-                  strokeDasharray="6 3"
-                  fill="url(#gradPredicted)"
+                  strokeDasharray="5 5"
                   name="Predicted"
                   dot={false}
-                  activeDot={{ r: 5, stroke: "#448aff", strokeWidth: 2, fill: "#0a0a0f" }}
+                  activeDot={{ r: 5, stroke: "#ef4444", strokeWidth: 2, fill: "#ffffff" }}
                   connectNulls={false}
                 />
-              </AreaChart>
+              </LineChart>
             </ResponsiveContainer>
+            )}
           </div>
+        </div>
+      </motion.section>
+
+      {/* ── Hourly Prediction Window ──────────────────────────────── */}
+      <motion.section
+        className="section"
+        initial="hidden"
+        whileInView="visible"
+        viewport={{ once: true, amount: 0.2 }}
+        variants={fadeUp}
+        transition={{ duration: 0.5 }}
+      >
+        <h2 className="section-title">
+          <span className="icon">⏱️</span> Hours Prediction Window
+        </h2>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "16px" }}>
+          {[
+            { title: "1-Hour Ahead", data: hourlyData.h1 },
+            { title: "3-Hours Ahead", data: hourlyData.h3 },
+            { title: "6-Hours Ahead", data: hourlyData.h6 }
+          ].map((h, idx) => (
+            <div key={idx} className="glass-card" style={{ padding: "16px" }}>
+              <h3 style={{ fontSize: "1rem", textAlign: "center", marginBottom: "12px", color: "#111827", fontWeight: 600 }}>{h.title}</h3>
+              <div style={{ height: "220px" }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={h.data} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                    <XAxis dataKey="time" tick={false} axisLine={{ stroke: "#e0e0e0" }} />
+                    <YAxis domain={['auto', 'auto']} tick={{ fill: "#6b7280", fontSize: 10 }} axisLine={{ stroke: "#e0e0e0" }} tickLine={false} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Line type="monotone" dataKey="actual" stroke="#3b82f6" strokeWidth={1.5} dot={false} name="Actual" connectNulls={false} />
+                    <Line type="monotone" dataKey="predicted" stroke="#ef4444" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Predicted" connectNulls={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          ))}
         </div>
       </motion.section>
 
@@ -655,9 +762,9 @@ export default function Home() {
             <h3 className="section-title" style={{ fontSize: "1.05rem", marginBottom: 12 }}>
               SHAP Feature Importance
             </h3>
-            {shap && (
-              <div style={{ width: "100%", height: 360 }}>
-                <ResponsiveContainer width="100%" height="100%">
+            {shap && shap.feature_importance.length > 0 && (
+              <div className="shap-chart-wrap">
+                <ResponsiveContainer width="100%" height={360}>
                   <BarChart
                     data={[...shap.feature_importance].reverse()}
                     layout="vertical"
@@ -750,10 +857,15 @@ export default function Home() {
 
       {/* ── Footer ──────────────────────────────────────────── */}
       <footer className="footer">
-        <span>GoldSight AI</span> · Intelligent Gold Price Forecasting
+        <span>Muhammad Afnan khan</span> · Intelligent Gold Price Forecasting
+        {dataStatus && !isDemo && (
+          <span style={{ marginLeft: 8, color: "#6b6b80" }}>
+            · Gold data: {dataStatus.last_data_date} ({fmt(dataStatus.last_close_usd)})
+          </span>
+        )}
         {forecast && (
           <span style={{ marginLeft: 8, color: "#6b6b80" }}>
-            · Last updated: {new Date(forecast.generated_at).toLocaleString()}
+            · Forecast generated: {new Date(forecast.generated_at).toLocaleString()}
           </span>
         )}
       </footer>

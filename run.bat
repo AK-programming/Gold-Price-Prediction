@@ -65,8 +65,19 @@ echo.
 :: ── Start Backend ──
 echo [3/4] Starting backend API on http://localhost:7860 ...
 start "GoldSight API" /D "%~dp0backend" cmd /k "title GoldSight API - Backend && color 0A && python run_server.py"
+echo       Waiting for API to become ready (up to 45s)...
+set /a WAIT_COUNT=0
+:wait_api
 timeout /t 3 /nobreak >nul
-echo       Backend started.
+powershell -NoProfile -Command "try { (Invoke-WebRequest -Uri 'http://127.0.0.1:7860/health' -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { exit 1 }" >nul 2>&1
+if %errorlevel% equ 0 goto api_ready
+set /a WAIT_COUNT+=1
+if %WAIT_COUNT% lss 15 goto wait_api
+echo [!] API not responding yet — open http://127.0.0.1:7860/health manually, then refresh the dashboard.
+goto api_done
+:api_ready
+echo       Backend API is ready.
+:api_done
 echo.
 
 :: ── Start Frontend ──
@@ -80,8 +91,8 @@ echo ============================================
 echo    All services running!
 echo.
 echo    Dashboard:  http://localhost:3000
-echo    API:        http://localhost:7860
-echo    API Docs:   http://localhost:7860/docs
+echo    API:        http://127.0.0.1:7860
+echo    API Docs:   http://127.0.0.1:7860/docs
 echo ============================================
 echo.
 echo Press any key to open the dashboard...

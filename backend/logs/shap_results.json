@@ -1,0 +1,106 @@
+{
+  "feature_importance": [
+    {
+      "rank": 1,
+      "feature": "gold_Close_t59",
+      "importance": 0.31155986040830613
+    },
+    {
+      "rank": 2,
+      "feature": "gold_Low_t59",
+      "importance": 0.09663186699151993
+    },
+    {
+      "rank": 3,
+      "feature": "gold_High_t59",
+      "importance": 0.03928723650053143
+    },
+    {
+      "rank": 4,
+      "feature": "gold_Close_t58",
+      "importance": 0.010967155317775906
+    },
+    {
+      "rank": 5,
+      "feature": "gold_Open_t59",
+      "importance": 0.008604730144143105
+    },
+    {
+      "rank": 6,
+      "feature": "gold_Open_t0",
+      "importance": 0.0049501734040677545
+    },
+    {
+      "rank": 7,
+      "feature": "gold_Close_ema_7_t59",
+      "importance": 0.0040141023742035035
+    },
+    {
+      "rank": 8,
+      "feature": "gold_Close_ema_7_t58",
+      "importance": 0.0032977110834326597
+    },
+    {
+      "rank": 9,
+      "feature": "gold_Close_lag_1_t59",
+      "importance": 0.0030377588758710773
+    },
+    {
+      "rank": 10,
+      "feature": "gold_High_t58",
+      "importance": 0.002875073633622378
+    },
+    {
+      "rank": 11,
+      "feature": "gold_Close_t57",
+      "importance": 0.001970143137150444
+    },
+    {
+      "rank": 12,
+      "feature": "gold_Close_bb_low_t52",
+      "importance": 0.0018414307112107054
+    },
+    {
+      "rank": 13,
+      "feature": "gold_Close_sma_7_t59",
+      "importance": 0.0017740218903054483
+    },
+    {
+      "rank": 14,
+      "feature": "treasury_10y_Open_t5",
+      "importance": 0.001566927881212905
+    },
+    {
+      "rank": 15,
+      "feature": "treasury_10y_Close_t1",
+      "importance": 0.0013833815240650437
+    },
+    {
+      "rank": 16,
+      "feature": "bitcoin_Volume_t0",
+      "importance": 0.0013721691000682767
+    },
+    {
+      "rank": 17,
+      "feature": "dollar_index_Open_t0",
+      "importance": 0.0013522933563217521
+    },
+    {
+      "rank": 18,
+      "feature": "silver_Close_t58",
+      "importance": 0.0012701937092060688
+    },
+    {
+      "rank": 19,
+      "feature": "silver_Close_t33",
+      "importance": 0.0012537133172736503
+    },
+    {
+      "rank": 20,
+      "feature": "gold_Open_t57",
+      "importance": 0.0012520314654102548
+    }
+  ],
+  "num_samples": 200,
+  "num_features": 5700
+}

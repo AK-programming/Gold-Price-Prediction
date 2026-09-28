@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# ML artifacts — checkpoints, processed data, scalers, and metrics ARE
+# committed on purpose: the deployed backend (Hugging Face Space) has no
+# free GPU/CPU budget to retrain on deploy, so it serves these files as-is.
+# Only truly regenerable/log noise stays ignored:
+backend/logs/*.log
+backend/data/raw_gold_data.parquet
+catboost_info/
+backend/backend-install.log
+backend/.pytest_cache/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/frontend-install.log
+
+# IDE / OS
+.vscode/
+.idea/
+*.log
+Thumbs.db
+.DS_Store

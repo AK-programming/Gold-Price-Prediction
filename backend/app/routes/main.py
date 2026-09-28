@@ -2,7 +2,7 @@
 Gold Price Forecasting System — Main FastAPI Application
 
 Creates and configures the FastAPI app instance, registers middleware,
-includes API routers, and optionally serves the frontend as static files.
+and includes API routers.
 """
 
 from __future__ import annotations
@@ -12,11 +12,11 @@ import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
-from app import config
+from app.routes.data import router as data_router
 from app.routes.predict import router as predict_router
 from app.routes.model_info import router as model_info_router
+from app.utils.model_selection import readiness_check
 
 # ------------------------------------------------------------------ #
 # Logging configuration
@@ -48,13 +48,13 @@ app = FastAPI(
 )
 
 # ------------------------------------------------------------------ #
-# CORS middleware
+# CORS middleware — allow frontend on any port to connect
 # ------------------------------------------------------------------ #
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -65,6 +65,7 @@ app.add_middleware(
 
 app.include_router(predict_router)
 app.include_router(model_info_router)
+app.include_router(data_router)
 
 logger.info("Registered predict and model_info routers.")
 
@@ -75,13 +76,7 @@ logger.info("Registered predict and model_info routers.")
 
 @app.get("/", tags=["status"])
 async def root() -> dict[str, str]:
-    """Return basic API information.
-
-    Returns
-    -------
-    dict
-        JSON payload with API name, version, and documentation URL.
-    """
+    """Return basic API information."""
     return {
         "api": "Gold Price Forecasting API",
         "version": "1.0.0",
@@ -91,30 +86,6 @@ async def root() -> dict[str, str]:
 
 
 @app.get("/health", tags=["status"])
-async def health_check() -> dict[str, str]:
-    """Lightweight health-check endpoint for load balancers and probes.
-
-    Returns
-    -------
-    dict
-        ``{"status": "healthy"}``
-    """
-    return {"status": "healthy"}
-
-
-# ------------------------------------------------------------------ #
-# Static file serving (frontend)
-# ------------------------------------------------------------------ #
-
-if config.FRONTEND_DIR.exists() and config.FRONTEND_DIR.is_dir():
-    app.mount(
-        "/static",
-        StaticFiles(directory=str(config.FRONTEND_DIR)),
-        name="static",
-    )
-    logger.info("Serving frontend static files from %s", config.FRONTEND_DIR)
-else:
-    logger.info(
-        "Frontend directory '%s' not found — static file serving disabled.",
-        config.FRONTEND_DIR,
-    )
+async def health_check() -> dict:
+    """Health check with data, scaler, and model readiness."""
+    return readiness_check()
