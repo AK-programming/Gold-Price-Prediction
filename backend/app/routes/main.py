@@ -8,6 +8,7 @@ and includes API routers.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 from fastapi import FastAPI
@@ -73,19 +74,41 @@ logger.info("Registered predict and model_info routers.")
 # Root & health endpoints
 # ------------------------------------------------------------------ #
 
+# Hugging Face Spaces sets SPACE_ID for every running Space. Its Gradio-SDK
+# supervisor expects a live Gradio interface at "/" to consider the app
+# healthy - serving plain JSON there instead makes it decide the app never
+# became ready and kill it a few seconds after startup. So on a Space we
+# mount a trivial status page at "/" instead of the JSON root below; every
+# other endpoint (/health, /docs, /api/v1/...) is unaffected either way.
+IS_HF_SPACE = bool(os.getenv("SPACE_ID"))
 
-@app.get("/", tags=["status"])
-async def root() -> dict[str, str]:
-    """Return basic API information."""
-    return {
-        "api": "Gold Price Forecasting API",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "openapi": "/openapi.json",
-    }
+if not IS_HF_SPACE:
+
+    @app.get("/", tags=["status"])
+    async def root() -> dict[str, str]:
+        """Return basic API information."""
+        return {
+            "api": "Gold Price Forecasting API",
+            "version": "1.0.0",
+            "docs": "/docs",
+            "openapi": "/openapi.json",
+        }
 
 
 @app.get("/health", tags=["status"])
 async def health_check() -> dict:
     """Health check with data, scaler, and model readiness."""
     return readiness_check()
+
+
+if IS_HF_SPACE:
+    import gradio as gr
+
+    with gr.Blocks(title="GoldSight AI Backend") as _status_ui:
+        gr.Markdown(
+            "## GoldSight AI — Backend is running\n\n"
+            "This Space serves the FastAPI backend for GoldSight AI.\n\n"
+            "- API docs: [/docs](/docs)\n"
+            "- Health check: [/health](/health)"
+        )
+    app = gr.mount_gradio_app(app, _status_ui, path="/")
