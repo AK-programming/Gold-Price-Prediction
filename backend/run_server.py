@@ -26,6 +26,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
+    # Temporary diagnostics: we've been chasing an "address already in use"
+    # error on port 7860 on Hugging Face Spaces. Print every env var that
+    # might explain it (an assigned $PORT, or anything HF/Gradio-related)
+    # so we know for certain instead of guessing.
+    _diag = {
+        k: v
+        for k, v in sorted(os.environ.items())
+        if any(s in k.upper() for s in ("PORT", "SPACE", "GRADIO", "HOST"))
+    }
+    logger.info("DIAGNOSTIC env vars: %s", _diag)
+
     logger.info(
         "Starting Gold Price Forecasting API on %s:%s",
         config.API_HOST,
